@@ -27,6 +27,7 @@ import {
   resolveEnvCredentials,
   resolveGatewayCredentials,
 } from "./mcp-server.js";
+import { S2S_HEADER, verifyS2sHeader } from "./s2s-verify.js";
 import { logger } from "./utils/logger.js";
 
 const CORS_ALLOW_HEADERS = [
@@ -50,6 +51,7 @@ async function startHttpTransport(): Promise<void> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
+  const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
   const mcpHandler = createMcpHandler(makeMcpServerFactory({ gatewayMode: isGatewayMode }), {
     legacy: "stateless",
@@ -92,6 +94,28 @@ async function startHttpTransport(): Promise<void> {
     }
 
     if (url.pathname === "/mcp") {
+      // S2S gate: reject any request not signed by the conduit gateway
+      // BEFORE any other processing — closes the confused-deputy gap where
+      // a compromised sibling sidecar could otherwise impersonate the
+      // gateway to this container. Empty CONDUIT_S2S_SECRET means
+      // enforcement is disabled (dark-by-default, matches the dormant
+      // pre-provisioning state).
+      if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: {
+              code: -32001,
+              message:
+                "Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.",
+            },
+            id: null,
+          })
+        );
+        return;
+      }
+
       // 401 gate: reject unauthenticated gateway traffic BEFORE serving —
       // falling through to env-configured credentials would serve the
       // operator's tenant data to whoever asked (cross-tenant leak).
